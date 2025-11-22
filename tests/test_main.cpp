@@ -14,6 +14,13 @@ inline uint64_t cpucycles() { return __rdtsc(); }
 
 using namespace KyberLab;
 
+// 辅助打印函数
+void print_poly(const std::string& label, const std::vector<i16>& p, int len = 16) {
+    std::cout << std::left << std::setw(15) << label << ": [";
+    for(int i=0; i<len; i++) std::cout << p[i] << (i==len-1?"":", ");
+    std::cout << "...]\n";
+}
+
 int main() {
     std::cout << "=== Kyber Performance: Naive vs NTT(Scalar) vs NTT(AVX2) ===\n";
     std::cout << "Parameters: N=256, q=3329\n\n";
@@ -31,38 +38,52 @@ int main() {
     auto res_scalar = poly_multiply_cpp(a, b);
     auto res_avx    = poly_multiply_avx(a, b);
 
-    // 2. 正确性检查
+    // 2. 正确性检查与DEBUG信息
     std::cout << "1. Checking Correctness...\n";
     
+    // 打印前16个值进行对比
+    print_poly("Naive", res_naive);
+    print_poly("NTT(Scalar)", res_scalar);
+    print_poly("NTT(AVX2)", res_avx);
+
     // Check Scalar vs Naive
     bool pass_scalar = true;
     for(int i=0; i<N; i++) {
-        if(res_scalar[i] != res_naive[i]) { pass_scalar = false; break; }
+        if(res_scalar[i] != res_naive[i]) { 
+            std::cout << "   [FAIL] Scalar mismatch at " << i 
+                      << ": Expected " << res_naive[i] << ", Got " << res_scalar[i] << "\n";
+            pass_scalar = false; 
+            break; 
+        }
     }
     std::cout << "   Scalar NTT vs Naive: " << (pass_scalar ? "[PASS]" : "[FAIL]") << "\n";
 
-    // Check AVX vs Naive (最重要的检查)
+    // Check AVX vs Naive
     bool pass_avx = true;
     for(int i=0; i<N; i++) {
         if(res_avx[i] != res_naive[i]) { 
-            std::cout << "   Mismatch at " << i << ": AVX=" << res_avx[i] << " Naive=" << res_naive[i] << "\n";
+            std::cout << "   [FAIL] AVX2 mismatch at " << i 
+                      << ": Expected " << res_naive[i] << ", Got " << res_avx[i] << "\n";
             pass_avx = false; 
             break; 
         }
     }
     std::cout << "   AVX2 NTT   vs Naive: " << (pass_avx ? "[PASS]" : "[FAIL]") << "\n\n";
 
-    if (!pass_scalar || !pass_avx) return 1;
+    if (!pass_scalar || !pass_avx) {
+        std::cout << "!!! Correctness failed. Aborting benchmark.\n";
+        return 1;
+    }
 
     // 3. Performance Benchmarking
     const int ITER = 50000;
     uint64_t start, end;
 
-    // A. Naive (跑少一点，太慢)
+    // A. Naive
     start = cpucycles();
-    for(int i=0; i<500; i++) naive_multiply(a, b);
+    for(int i=0; i<100; i++) naive_multiply(a, b); // 跑少一点
     end = cpucycles();
-    double cyc_naive = (double)(end - start) / 500.0;
+    double cyc_naive = (double)(end - start) / 100.0;
 
     // B. NTT Scalar
     start = cpucycles();

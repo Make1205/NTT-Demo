@@ -1,26 +1,38 @@
 #include "ntt.h"
 #include <vector>
-#include <iostream>
-#include <algorithm>
 #include <immintrin.h>
+#include <iostream>
+#include <iomanip>
 
 namespace KyberLab {
 
     // =============================================================
-    // 1. Constants & Tables
+    // 0. Configuration
     // =============================================================
-    // const int16_t Q = 3329;
+    // [FINAL MODE] Performance benchmarking only
+    static bool ENABLE_DEBUG = false; 
+
+    void print_debug(const char* label, const int16_t* r) {
+        if (!ENABLE_DEBUG) return;
+        std::cout << std::left << std::setw(15) << label << ": [";
+        for(int i=0; i<8; i++) std::cout << r[i] << ", ";
+        std::cout << "...]\n";
+    }
+
+    // =============================================================
+    // 1. Constants
+    // =============================================================
     const int16_t QINV = -3327; 
-    const int16_t MONT = 2285;  
     const int16_t R2 = 1353;    
+    const int16_t F_FACTOR = 1441; 
+    
+    // AVX Constants
+    const __m256i AVX_Q = _mm256_set1_epi16(3329);
+    const __m256i AVX_QINV = _mm256_set1_epi16(-3327);
+    const __m256i AVX_R2 = _mm256_set1_epi16(1353);
+    const __m256i AVX_F = _mm256_set1_epi16(1441); 
+    const __m256i AVX_BARRETT_MUL = _mm256_set1_epi16(20159); 
 
-    // AVX2 Constants
-    const __m256i AVX_Q = _mm256_set1_epi16(Q);
-    const __m256i AVX_QINV = _mm256_set1_epi16(QINV);
-    const __m256i AVX_R2 = _mm256_set1_epi16(R2);
-    const __m256i AVX_ZERO = _mm256_setzero_si256();
-
-    // [Cite: ntt.c]
     const int16_t zetas[128] = {
       -1044,  -758,  -359, -1517,  1493,  1422,   287,   202,
        -171,   622,  1577,   182,   962, -1202, -1474,  1468,
@@ -43,46 +55,203 @@ namespace KyberLab {
     void init_tables() {} 
 
     // =============================================================
-    // 2. Core Arithmetic (Scalar & AVX)
+    // 2. High-Performance Math
     // =============================================================
 
-    // Scalar Montgomery
     inline int16_t montgomery_reduce(int32_t a) {
         int16_t u = (int16_t)(a * (int32_t)QINV);
-        int32_t t = (int32_t)((int64_t)u * Q);
+        int32_t t = (int32_t)((int64_t)u * 3329);
         t = a - t;
         t >>= 16;
         return (int16_t)t;
     }
-
-    inline int16_t barrett_reduce(int16_t a) {
-        int16_t v = ((int32_t)a * 20159) >> 26;
-        v = a - v * Q;
-        return v;
-    }
-
+    
     inline int16_t fqmul(int16_t a, int16_t b) {
         return montgomery_reduce((int32_t)a * b);
     }
 
-    // AVX2 Montgomery [a * b * R^-1 mod Q]
-    inline __m256i fqmul_avx(__m256i a, __m256i b) {
-        __m256i lo = _mm256_mullo_epi16(a, b);
-        __m256i hi = _mm256_mulhi_epi16(a, b);
-        __m256i t = _mm256_mullo_epi16(lo, AVX_QINV);
-        __m256i t_times_q_hi = _mm256_mulhi_epi16(t, AVX_Q);
-        return _mm256_sub_epi16(hi, t_times_q_hi);
+    inline int16_t barrett_reduce(int16_t a) {
+        int16_t v = ((int32_t)a * 20159) >> 26;
+        v = a - v * 3329;
+        return v;
+    }
+
+    inline __m256i montgomery_mul_avx(__m256i a, __m256i b) {
+        __m256i t_low = _mm256_mullo_epi16(a, b);
+        __m256i k = _mm256_mullo_epi16(t_low, AVX_QINV);
+        __m256i m = _mm256_mulhi_epi16(k, AVX_Q);
+        __m256i t_high = _mm256_mulhi_epi16(a, b);
+        return _mm256_sub_epi16(t_high, m);
+    }
+
+    inline __m256i barrett_reduce_avx(__m256i a) {
+        __m256i v = _mm256_mulhi_epi16(a, AVX_BARRETT_MUL);
+        v = _mm256_srai_epi16(v, 10); 
+        __m256i vq = _mm256_mullo_epi16(v, AVX_Q);
+        return _mm256_sub_epi16(a, vq);
     }
 
     // =============================================================
-    // 3. Transform Logic (Scalar - Verified Correct)
+    // 3. Robust AVX2 NTT
     // =============================================================
 
-    //
+    inline void butterfly_avx(__m256i& a, __m256i& b, __m256i zeta) {
+        __m256i t = montgomery_mul_avx(b, zeta);
+        b = _mm256_sub_epi16(a, t);
+        a = _mm256_add_epi16(a, t);
+    }
+
+    void ntt_avx(int16_t* r) {
+        // --- Phase 1: AVX for Large Layers (128, 64, 32, 16) ---
+        __m256i zeta = _mm256_set1_epi16(zetas[1]);
+        for(int i=0; i<128; i+=16) {
+            __m256i a = _mm256_loadu_si256((__m256i*)&r[i]);
+            __m256i b = _mm256_loadu_si256((__m256i*)&r[i+128]);
+            butterfly_avx(a, b, zeta);
+            _mm256_storeu_si256((__m256i*)&r[i], a);
+            _mm256_storeu_si256((__m256i*)&r[i+128], b);
+        }
+
+        int k = 2;
+        for(int len=64; len>=16; len/=2) {
+             for(int start=0; start<256; start+=2*len) {
+                 zeta = _mm256_set1_epi16(zetas[k++]);
+                 for(int i=start; i<start+len; i+=16) {
+                    __m256i a = _mm256_loadu_si256((__m256i*)&r[i]);
+                    __m256i b = _mm256_loadu_si256((__m256i*)&r[i+len]);
+                    butterfly_avx(a, b, zeta);
+                    _mm256_storeu_si256((__m256i*)&r[i], a);
+                    _mm256_storeu_si256((__m256i*)&r[i+len], b);
+                 }
+             }
+        }
+
+        // --- Phase 2: Scalar for Small Layers (8, 4, 2) ---
+        // Robust Fallback (Correctness Priority)
+        for(int len = 8; len >= 2; len >>= 1) {
+            for(int start = 0; start < 256; start += 2*len) {
+                int16_t z = zetas[k++];
+                for(int j = start; j < start + len; j++) {
+                    int16_t t = fqmul(z, r[j + len]);
+                    r[j + len] = r[j] - t;
+                    r[j] = r[j] + t;
+                }
+            }
+        }
+    }
+
+    // =============================================================
+    // 4. Robust AVX2 InvNTT
+    // =============================================================
+    
+    inline void inv_butterfly_avx(__m256i& a, __m256i& b, __m256i zeta) {
+        __m256i sum = _mm256_add_epi16(a, b);
+        __m256i diff = _mm256_sub_epi16(b, a); // b - a
+        a = barrett_reduce_avx(sum);           
+        b = montgomery_mul_avx(diff, zeta);
+    }
+
+    void invntt_avx(int16_t* r) {
+        int k = 127;
+        
+        // --- Phase 1: Scalar for Small Layers (2, 4) ---
+        for(int len = 2; len <= 4; len <<= 1) {
+            for(int start = 0; start < 256; start += 2*len) {
+                int16_t z = zetas[k--];
+                for(int j = start; j < start + len; j++) {
+                    int16_t t = r[j];
+                    r[j] = barrett_reduce(t + r[j + len]);
+                    r[j + len] = r[j + len] - t; // b - a
+                    r[j + len] = fqmul(z, r[j + len]);
+                }
+            }
+        }
+
+        // --- Phase 2: AVX Layer 8 (Shuffle) ---
+        for(int start = 0; start < 256; start += 16) {
+             __m256i zeta = _mm256_set1_epi16(zetas[k--]);
+             __m256i v = _mm256_loadu_si256((__m256i*)&r[start]);
+             
+             __m256i b_swapped = _mm256_permute2x128_si256(v, v, 0x01); 
+             __m256i a = v; 
+             
+             __m256i sum = _mm256_add_epi16(a, b_swapped);
+             __m256i diff = _mm256_sub_epi16(b_swapped, a); 
+             
+             a = barrett_reduce_avx(sum);          
+             b_swapped = montgomery_mul_avx(diff, zeta); 
+             
+             __m256i final_v = _mm256_inserti128_si256(a, _mm256_castsi256_si128(b_swapped), 1);
+             _mm256_storeu_si256((__m256i*)&r[start], final_v);
+        }
+
+        // --- Phase 3: AVX Large Layers (16, 32, 64, 128) ---
+        for(int len = 16; len <= 128; len <<= 1) {
+            for(int start = 0; start < 256; start += 2*len) {
+                __m256i zeta = _mm256_set1_epi16(zetas[k--]);
+                for(int j = start; j < start + len; j+=16) {
+                    __m256i a = _mm256_loadu_si256((__m256i*)&r[j]);
+                    __m256i b = _mm256_loadu_si256((__m256i*)&r[j+len]);
+                    
+                    inv_butterfly_avx(a, b, zeta);
+                    
+                    _mm256_storeu_si256((__m256i*)&r[j], a);
+                    _mm256_storeu_si256((__m256i*)&r[j+len], b);
+                }
+            }
+        }
+        
+        // Final Factor Scaling (AVX)
+        const __m256i v_f = AVX_F;
+        for(int i=0; i<256; i+=16) {
+             __m256i a = _mm256_loadu_si256((__m256i*)&r[i]);
+             a = montgomery_mul_avx(a, v_f);
+             _mm256_storeu_si256((__m256i*)&r[i], a);
+        }
+    }
+
+    // =============================================================
+    // 5. Wrappers & BaseMul
+    // =============================================================
+    
+    inline __m256i swap_adjacent_pairs(__m256i v) {
+        v = _mm256_shufflelo_epi16(v, 0xB1);
+        v = _mm256_shufflehi_epi16(v, 0xB1);
+        return v;
+    }
+
+    void poly_basemul_avx(int16_t* r, const int16_t* a, const int16_t* b) {
+        for(int i=0; i<256/16; i++) { 
+            int16_t z0 = zetas[64 + i*4 + 0];
+            int16_t z1 = zetas[64 + i*4 + 1];
+            int16_t z2 = zetas[64 + i*4 + 2];
+            int16_t z3 = zetas[64 + i*4 + 3];
+            __m256i vzeta = _mm256_set_epi16(-z3, -z3, z3, z3, -z2, -z2, z2, z2, -z1, -z1, z1, z1, -z0, -z0, z0, z0);
+            __m256i va = _mm256_loadu_si256((__m256i*)&a[i*16]);
+            __m256i vb = _mm256_loadu_si256((__m256i*)&b[i*16]);
+            __m256i va_swap = swap_adjacent_pairs(va);
+            __m256i v_prod_rot = montgomery_mul_avx(va_swap, vb); 
+            __m256i r1_vec = _mm256_add_epi16(v_prod_rot, swap_adjacent_pairs(v_prod_rot));
+            __m256i v_prod = montgomery_mul_avx(va, vb);
+            __m256i v_prod_swapped = swap_adjacent_pairs(v_prod);
+            __m256i v_term_zeta = montgomery_mul_avx(v_prod_swapped, vzeta);
+            __m256i r0_vec = _mm256_add_epi16(v_prod, v_term_zeta);
+            __m256i res = _mm256_blend_epi16(r0_vec, r1_vec, 0xAA);
+            _mm256_storeu_si256((__m256i*)&r[i*16], res);
+        }
+    }
+
+    void poly_tomont_avx(int16_t* r) {
+        for(int i=0; i<256; i+=16) {
+            __m256i a = _mm256_loadu_si256((__m256i*)&r[i]);
+            a = montgomery_mul_avx(a, AVX_R2);
+            _mm256_storeu_si256((__m256i*)&r[i], a);
+        }
+    }
+
     void ntt(int16_t* r) {
-        unsigned int len, start, j, k;
+        unsigned int len, start, j, k=1;
         int16_t t, zeta;
-        k = 1;
         for(len = 128; len >= 2; len >>= 1) {
             for(start = 0; start < 256; start = j + len) {
                 zeta = zetas[k++];
@@ -94,180 +263,90 @@ namespace KyberLab {
             }
         }
     }
-
-    //
     void invntt(int16_t* r) {
-        unsigned int start, len, j, k;
+        unsigned int start, len, j, k=127;
         int16_t t, zeta;
-        const int16_t f = 1441; 
-        k = 127;
         for(len = 2; len <= 128; len <<= 1) {
             for(start = 0; start < 256; start = j + len) {
                 zeta = zetas[k--];
                 for(j = start; j < start + len; j++) {
                     t = r[j];
                     r[j] = barrett_reduce(t + r[j + len]);
-                    r[j + len] = r[j + len] - t;
+                    r[j + len] = r[j + len] - t; 
                     r[j + len] = fqmul(zeta, r[j + len]);
                 }
             }
         }
-        for(j = 0; j < 256; j++)
-            r[j] = fqmul(r[j], f);
+        for(j = 0; j < 256; j++) r[j] = fqmul(r[j], F_FACTOR); 
     }
-
-    // - Used only for scalar fallback or reference
-    void basemul(int16_t r[2], const int16_t a[2], const int16_t b[2], int16_t zeta) {
-        r[0]  = fqmul(a[1], b[1]);
-        r[0]  = fqmul(r[0], zeta);
-        r[0] += fqmul(a[0], b[0]);
-        r[1]  = fqmul(a[0], b[1]);
-        r[1] += fqmul(a[1], b[0]);
-    }
-
-    // =============================================================
-    // 4. AVX2 Accelerators
-    // =============================================================
-
-    // 1. Input Conversion (O(N))
-    void poly_tomont_avx(int16_t* r) {
-        for(int i=0; i<256; i+=16) {
-            __m256i a = _mm256_loadu_si256((__m256i*)&r[i]);
-            a = fqmul_avx(a, AVX_R2);
-            _mm256_storeu_si256((__m256i*)&r[i], a);
-        }
-    }
-
-    // 2. Base Multiplication (O(N))
-    void poly_basemul_avx(int16_t* r, const int16_t* a, const int16_t* b) {
-        for(int i=0; i<256/16; i++) { 
-            int16_t z0 = zetas[64 + i*4 + 0];
-            int16_t z1 = zetas[64 + i*4 + 1];
-            int16_t z2 = zetas[64 + i*4 + 2];
-            int16_t z3 = zetas[64 + i*4 + 3];
-
-            // Construct zeta vector for odd positions
-            // Pair 7: -z3, Pair 6: z3, ..., Pair 0: z0
-            __m256i vzeta = _mm256_set_epi16(
-                0, -z3, 
-                0,  z3, 
-                0, -z2, 
-                0,  z2, 
-                0, -z1, 
-                0,  z1, 
-                0, -z0, 
-                0,  z0
-            );
-
-            __m256i va = _mm256_loadu_si256((__m256i*)&a[i*16]);
-            __m256i vb = _mm256_loadu_si256((__m256i*)&b[i*16]);
-
-            __m256i vprod = fqmul_avx(va, vb);
-
-            // Swap adjacent 16-bit values
-            __m256i va_swap = _mm256_shufflelo_epi16(va, 0xB1);
-            va_swap = _mm256_shufflehi_epi16(va_swap, 0xB1);
-            
-            __m256i vprod_cross = fqmul_avx(va_swap, vb);
-
-            __m256i vprod_swap = _mm256_shufflelo_epi16(vprod, 0xB1);
-            vprod_swap = _mm256_shufflehi_epi16(vprod_swap, 0xB1);
-            
-            __m256i term_zeta = fqmul_avx(vprod_swap, vzeta);
-            __m256i r_even = _mm256_add_epi16(vprod, term_zeta);
-
-            __m256i vprod_cross_swap = _mm256_shufflelo_epi16(vprod_cross, 0xB1);
-            vprod_cross_swap = _mm256_shufflehi_epi16(vprod_cross_swap, 0xB1);
-            
-            __m256i r_odd = _mm256_add_epi16(vprod_cross, vprod_cross_swap);
-
-            // Merge even/odd results
-            __m256i res = _mm256_blend_epi16(r_even, r_odd, 0xAA);
-
-            _mm256_storeu_si256((__m256i*)&r[i*16], res);
-        }
-    }
-
-    // 3. Output Conversion & Scaling (O(N))
-    // Applies TWO montgomery reductions to remove R^2 factor
-    void poly_final_map_avx(int16_t* r) {
-        const __m256i v_one = _mm256_set1_epi16(1); 
-
-        for(int i=0; i<256; i+=16) {
-            __m256i val = _mm256_loadu_si256((__m256i*)&r[i]);
-            
-            // Reduction 1: x * R^-1
-            val = fqmul_avx(val, v_one);
-            // Reduction 2: x * R^-2
-            val = fqmul_avx(val, v_one);
-            
-            // Normalize to positive [0, Q)
-            __m256i mask = _mm256_cmpgt_epi16(AVX_ZERO, val); 
-            __m256i add_q = _mm256_and_si256(mask, AVX_Q);
-            val = _mm256_add_epi16(val, add_q);
-            
-            _mm256_storeu_si256((__m256i*)&r[i], val);
-        }
-    }
-
-    // =============================================================
-    // 5. Wrappers
-    // =============================================================
 
     std::vector<i16> poly_multiply_cpp(const std::vector<i16>& a, const std::vector<i16>& b) {
-        std::vector<i16> ta = a;
-        std::vector<i16> tb = b;
-        std::vector<i16> res(N);
-
-        // 1. To Mont
+        std::vector<i16> ta = a, tb = b, res(N);
         for(int i=0; i<N; i++) { ta[i] = fqmul(ta[i], R2); tb[i] = fqmul(tb[i], R2); }
+        ntt(ta.data()); 
+        if(ENABLE_DEBUG) print_debug("Scalar NTT", ta.data());
         
-        // 2. NTT
-        ntt(ta.data());
         ntt(tb.data());
-        
-        // 3. BaseMul
         for(int i = 0; i < N / 4; i++) {
-            basemul(&res[4*i], &ta[4*i], &tb[4*i], zetas[64+i]);
-            basemul(&res[4*i+2], &ta[4*i+2], &tb[4*i+2], -zetas[64+i]);
+            int16_t r0, r1;
+            int16_t z = zetas[64+i];
+            r0  = fqmul(ta[4*i+1], tb[4*i+1]);
+            r0  = fqmul(r0, z);
+            r0 += fqmul(ta[4*i], tb[4*i]);
+            r1  = fqmul(ta[4*i], tb[4*i+1]);
+            r1 += fqmul(ta[4*i+1], tb[4*i]);
+            res[4*i] = r0; res[4*i+1] = r1;
+            z = -z;
+            r0  = fqmul(ta[4*i+3], tb[4*i+3]);
+            r0  = fqmul(r0, z);
+            r0 += fqmul(ta[4*i+2], tb[4*i+2]);
+            r1  = fqmul(ta[4*i+2], tb[4*i+3]);
+            r1 += fqmul(ta[4*i+3], tb[4*i+2]);
+            res[4*i+2] = r0; res[4*i+3] = r1;
         }
-        
-        // 4. InvNTT (Output is val * 128^-1 * R^2)
-        invntt(res.data());
+        if(ENABLE_DEBUG) print_debug("Scalar Base", res.data());
 
-        // 5. Final fix: Remove R^2
+        invntt(res.data());
+        if(ENABLE_DEBUG) print_debug("Scalar Inv", res.data());
+
         for(int i=0; i<N; i++) {
             int16_t val = res[i];
-            val = montgomery_reduce((int32_t)val); // Reduce 1
-            val = montgomery_reduce((int32_t)val); // Reduce 2
-            res[i] = (val < 0) ? val + Q : val;
+            val = montgomery_reduce((int32_t)val); 
+            val = montgomery_reduce((int32_t)val); 
+            res[i] = (val < 0) ? val + 3329 : val;
         }
         return res;
     }
 
-    // --- Fully Accelerated AVX2 Version ---
     std::vector<i16> poly_multiply_avx(const std::vector<i16>& a, const std::vector<i16>& b) {
-        std::vector<i16> ta = a;
-        std::vector<i16> tb = b;
-        std::vector<i16> res(N);
+        if(ENABLE_DEBUG) std::cout << "\n--- AVX Debug Trace ---\n";
 
-        // 1. AVX Tomont
+        std::vector<i16> ta = a, tb = b, res(N);
         poly_tomont_avx(ta.data());
         poly_tomont_avx(tb.data());
+        
+        ntt_avx(ta.data());
+        if(ENABLE_DEBUG) print_debug("AVX NTT", ta.data());
 
-        // 2. Scalar NTT (Keep scalar for correctness)
-        ntt(ta.data());
-        ntt(tb.data());
+        ntt_avx(tb.data());
+        
+        poly_basemul_avx(res.data(), ta.data(), tb.data()); // AVX
+        if(ENABLE_DEBUG) print_debug("AVX Base", res.data());
 
-        // 3. AVX BaseMul
-        poly_basemul_avx(res.data(), ta.data(), tb.data());
-
-        // 4. Scalar InvNTT
-        invntt(res.data());
-
-        // 5. AVX Final Map (Double Reduction)
-        poly_final_map_avx(res.data());
-
+        invntt_avx(res.data()); 
+        if(ENABLE_DEBUG) print_debug("AVX Inv", res.data());
+        
+        // Final Map AVX
+        const __m256i v_one = _mm256_set1_epi16(1); 
+        for(int i=0; i<256; i+=16) {
+            __m256i val = _mm256_loadu_si256((__m256i*)&res[i]);
+            val = montgomery_mul_avx(val, v_one); 
+            val = montgomery_mul_avx(val, v_one); 
+            __m256i mask = _mm256_cmpgt_epi16(_mm256_setzero_si256(), val); 
+            __m256i add_q = _mm256_and_si256(mask, AVX_Q);
+            val = _mm256_add_epi16(val, add_q);
+            _mm256_storeu_si256((__m256i*)&res[i], val);
+        }
         return res;
     }
 
@@ -277,16 +356,11 @@ namespace KyberLab {
             for (int j = 0; j < N; j++) {
                 int idx = i + j;
                 int32_t prod = (int32_t)a[i] * b[j];
-                if (idx < N) {
-                    res[idx] = (int16_t)(((int32_t)res[idx] + prod) % Q); 
-                } else {
-                    res[idx - N] = (int16_t)(((int32_t)res[idx - N] - prod) % Q);
-                }
+                if (idx < N) res[idx] = (int16_t)(((int32_t)res[idx] + prod) % 3329); 
+                else res[idx - N] = (int16_t)(((int32_t)res[idx - N] - prod) % 3329);
             }
         }
-        for(int i=0; i<N; i++) {
-            if(res[i] < 0) res[i] += Q;
-        }
+        for(int i=0; i<N; i++) if(res[i] < 0) res[i] += 3329;
         return res;
     }
 }
